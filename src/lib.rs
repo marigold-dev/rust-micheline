@@ -64,8 +64,8 @@ fn write_zarith(buffer: &mut Vec<u8>, value: i32) -> usize {
     // TODO: How to require an interface for arbitrary size integers
     // without depending on a specific library?
 
-    let mut size = 0;
     let sign = value < 0;
+    let mut size = 0;
     let mut value = value.abs();
 
     let mut first = if value > 0x3f { value & 0x3f | 0x80 } else { value & 0x3f } as u8;
@@ -80,10 +80,9 @@ fn write_zarith(buffer: &mut Vec<u8>, value: i32) -> usize {
 
     while value != 0 {
         let byte = if value > 0x7f { value & 0x7f | 0x80 } else { value & 0x7f } as u8;
-
         buffer.push(byte);
-        size += 1;
 
+        size += 1;
         value = value >> 7;
     }
 
@@ -280,7 +279,7 @@ impl<P: Encodable + Debug> Node<P> {
                 Ok((Node::Prim(prim, args, annot), prim_size + args_size + annot_size))
             },
             10 => {
-                let (value, size) = read_vec(&buffer[1..])?;
+                let (value, size) = read_vec(&buffer[offset + 1..])?;
                 Ok((Node::Bytes(value), size + 1))
             }
             _ => Err("Invalid value")
@@ -292,6 +291,22 @@ impl<P: Encodable + Debug> Node<P> {
         Ok(value)
     }
 
+}
+
+pub mod michelson_v1_primitives;
+use michelson_v1_primitives::{*};
+
+impl Encodable for Primitive {
+    fn encode_to_buffer(&self, buffer: &mut Vec<u8>) -> usize {
+        buffer.push(self.to_int_enum());
+        1
+    }
+
+    fn decode_from_buffer(buffer: &[u8]) -> Result<(Self, usize), &str> where Self: Sized {
+        Primitive::from_int_enum(buffer[0])
+            .map(|value| (value, 1))
+            .ok_or("Invalid primitive value")
+    }
 }
 
 #[cfg(test)]
@@ -610,5 +625,80 @@ mod tests {
                 vec![String::from("%annot1"), String::from("%annot2")]
             )
         );
+    }
+
+    #[test]
+    fn michelson_v1_primitives() {
+        use michelson_v1_primitives::Primitive::{D_Pair, I_PUSH, I_ADD, T_nat};
+
+        assert_eq!(
+            Node::Prim(
+                D_Pair,
+                vec![
+                    Node::String(String::from("KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc")),
+                    Node::Bytes(b"deadbeef".to_vec())
+                ],
+                vec![]
+            ).encode(),
+            b"\x07\x07\x01\x00\x00\x00\x24KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc\x0a\x00\x00\x00\x08deadbeef"
+        );
+        assert_eq!(
+            Node::Seq(vec![
+                Node::Prim(
+                    I_PUSH,
+                    vec![
+                        Node::Prim(T_nat, vec![], vec![]),
+                        Node::Int(1),
+                    ],
+                    vec![String::from("%one")]
+                ),
+                Node::Prim(
+                    I_PUSH,
+                    vec![
+                        Node::Prim(T_nat, vec![], vec![]),
+                        Node::Int(2),
+                    ],
+                    vec![String::from("%two")]
+                ),
+                Node::Prim(I_ADD, vec![], vec![])
+            ]).encode(),
+            b"\x02\x00\x00\x00\x1e\x08\x43\x03\x62\x00\x01\x00\x00\x00\x04%one\x08\x43\x03\x62\x00\x02\x00\x00\x00\x04%two\x03\x12"
+        );
+
+
+        assert_eq!(
+            Node::from(b"\x07\x07\x01\x00\x00\x00\x24KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc\x0a\x00\x00\x00\x08deadbeef").unwrap(),
+            Node::Prim(
+                D_Pair,
+                vec![
+                    Node::String(String::from("KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc")),
+                    Node::Bytes(b"deadbeef".to_vec())
+                ],
+                vec![]
+            ),
+        );
+        assert_eq!(
+            Node::from(b"\x02\x00\x00\x00\x1e\x08\x43\x03\x62\x00\x01\x00\x00\x00\x04%one\x08\x43\x03\x62\x00\x02\x00\x00\x00\x04%two\x03\x12").unwrap(),
+            Node::Seq(vec![
+                Node::Prim(
+                    I_PUSH,
+                    vec![
+                        Node::Prim(T_nat, vec![], vec![]),
+                        Node::Int(1),
+                    ],
+                    vec![String::from("%one")]
+                ),
+                Node::Prim(
+                    I_PUSH,
+                    vec![
+                        Node::Prim(T_nat, vec![], vec![]),
+                        Node::Int(2),
+                    ],
+                    vec![String::from("%two")]
+                ),
+                Node::Prim(I_ADD, vec![], vec![])
+            ])
+        );
+
     }
 }
