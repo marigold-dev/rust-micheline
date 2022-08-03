@@ -1,10 +1,19 @@
 use std::fmt::Debug;
 
-type Annot = Vec<String>;
+#[derive(Debug, PartialEq)]
+pub enum Error {
+    OutOfBounds,
+    InvalidInteger,
+    InvalidString,
+    InvalidPrimitive,
+    InvalidList
+}
+
+pub type Annot = Vec<String>;
 
 pub trait Encodable {
     fn encode_to_buffer(&self, buffer: &mut Vec<u8>) -> usize;
-    fn decode_from_buffer(buffer: &[u8]) -> Result<(Self, usize), &str> where Self: Sized;
+    fn decode_from_buffer(buffer: &[u8]) -> Option<(Self, usize)> where Self: Sized;
 }
 
 #[derive(Debug, PartialEq)]
@@ -23,18 +32,30 @@ fn write_int_be(buffer: &mut Vec<u8>, value: i32) {
     buffer.push((value       & 0xff) as u8);
 }
 
-fn read_int_be(buffer: &[u8]) -> i32 {
-    ((buffer[0] as i32) << 24) |
-    ((buffer[1] as i32) << 16) |
-    ((buffer[2] as i32) <<  8) |
-    ((buffer[3] as i32)     )
+fn read_int_be(buffer: &[u8]) -> Result<i32, Error>  {
+    if buffer.len() < 4 {
+        return Err(Error::OutOfBounds)
+    }
+
+    Ok(
+        ((buffer[0] as i32) << 24) |
+        ((buffer[1] as i32) << 16) |
+        ((buffer[2] as i32) <<  8) |
+        ((buffer[3] as i32)     )
+    )
 }
 
-fn write_int_be_into_offset(buffer: &mut Vec<u8>, value: i32, offset: usize) {
+fn write_int_be_into_offset(buffer: &mut Vec<u8>, value: i32, offset: usize) -> Result<(), Error> {
+    if buffer.len() < offset + 4 {
+        return Err(Error::OutOfBounds)
+    }
+
     buffer[offset    ] = (value >> 24 & 0xff) as u8;
     buffer[offset + 1] = (value >> 16 & 0xff) as u8;
     buffer[offset + 2] = (value >>  8 & 0xff) as u8;
     buffer[offset + 3] = (value       & 0xff) as u8;
+
+    Ok(())
 }
 
 fn write_array(buffer: &mut Vec<u8>, value: &[u8]) -> usize {
@@ -53,7 +74,8 @@ fn write_list<P: Encodable + Debug>(buffer: &mut Vec<u8>, values: &Vec<Node<P>>)
     for value in values {
         size += value.encode_to_buffer(buffer);
     }
-    write_int_be_into_offset(buffer, size as i32, size_offset);
+    write_int_be_into_offset(buffer, size as i32, size_offset)
+        .expect("Should not happen");
     size + 4
 }
 
@@ -89,7 +111,7 @@ fn write_zarith(buffer: &mut Vec<u8>, value: i32) -> usize {
     size
 }
 
-fn read_zarith(buffer: &[u8]) -> (i32, usize) {
+fn read_zarith(buffer: &[u8]) -> Result<(i32, usize), Error> {
     let mut byte = buffer[0] as i32;
     let mut value = byte & 0x3f;
     let mut shift = 6;
@@ -98,6 +120,10 @@ fn read_zarith(buffer: &[u8]) -> (i32, usize) {
     let sign = byte & 0x40 == 0x40;
 
     while (byte & 0x80) == 0x80 {
+        if index >= buffer.len() {
+            return Err(Error::InvalidInteger)
+        }
+
         byte = buffer[index] as i32;
         value = value | ((byte & 0x7f) << shift);
 
@@ -105,12 +131,12 @@ fn read_zarith(buffer: &[u8]) -> (i32, usize) {
         shift += 7;
     }
 
-    if sign { (-value, index as usize) }
-    else { (value, index) }
+    if sign { Ok((-value, index as usize)) }
+    else { Ok((value, index)) }
 }
 
-fn read_list<P: Encodable + Debug>(buffer: &[u8]) -> Result<(Vec<Node<P>>, usize), &str> {
-    let size = read_int_be(buffer) as usize;
+fn read_list<P: Encodable + Debug>(buffer: &[u8]) -> Result<(Vec<Node<P>>, usize), Error> {
+    let size = read_int_be(buffer)? as usize;
     let mut items = Vec::new();
     let mut offset = 4;
 
@@ -120,19 +146,27 @@ fn read_list<P: Encodable + Debug>(buffer: &[u8]) -> Result<(Vec<Node<P>>, usize
         items.push(item);
     }
 
+    if offset != size + 4 {
+        return Err(Error::InvalidList);
+    }
+
     Ok((items, size + 4))
 }
 
-fn read_vec(buffer: &[u8]) -> Result<(Vec<u8>, usize), &str> {
-    let size = read_int_be(buffer) as usize;
+fn read_vec(buffer: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+    let size = read_int_be(buffer)? as usize;
+    if size + 4 > buffer.len() {
+        return Err(Error::InvalidString);
+    }
+
     let value = (&buffer[4..size + 4]).to_vec();
 
     Ok((value, size + 4))
 }
 
-fn read_annotation(buffer: &[u8]) -> Result<(Vec<String>, usize), &str> {
+fn read_annotation(buffer: &[u8]) -> Result<(Vec<String>, usize), Error> {
     let (vec, size) = read_vec(buffer)?;
-    let annot = String::from_utf8(vec).expect("Only UTF-8 allowed");
+    let annot = String::from_utf8(vec).map_err(|_| Error::InvalidString)?;
 
     Ok((annot.split(" ").map(String::from).collect(), size))
 }
@@ -144,53 +178,55 @@ fn encode_annotation(buffer: &mut Vec<u8>, annot: &Vec<String>) -> usize {
 }
 
 fn encode_primitive<P: Encodable + Debug>(buffer: &mut Vec<u8>, prim: &P, args: &Vec<Node<P>>, annot: &Vec<String>) -> usize {
-    match (&args[..], &annot[..]) {
-        ([], []) => {
-            buffer.push(3);
-            prim.encode_to_buffer(buffer) + 1
-        },
-        ([], _) => {
-            buffer.push(4);
-            prim.encode_to_buffer(buffer)
-            + encode_annotation(buffer, annot)
-            + 1
-        },
-        ([arg1], []) => {
-            buffer.push(5);
-            prim.encode_to_buffer(buffer)
-            + arg1.encode_to_buffer(buffer)
-            + 1
-        },
-        ([arg1], _) => {
-            buffer.push(6);
-            prim.encode_to_buffer(buffer)
-            + arg1.encode_to_buffer(buffer)
-            + encode_annotation(buffer, annot)
-            + 1
-        },
-        ([arg1, arg2], []) => {
-            buffer.push(7);
-            prim.encode_to_buffer(buffer)
-            + arg1.encode_to_buffer(buffer)
-            + arg2.encode_to_buffer(buffer)
-            + 1
-        },
-        ([arg1, arg2], _) => {
-            buffer.push(8);
-            prim.encode_to_buffer(buffer)
-            + arg1.encode_to_buffer(buffer)
-            + arg2.encode_to_buffer(buffer)
-            + encode_annotation(buffer, annot)
-            + 1
-        }
-        (_, _) => {
-            buffer.push(9);
-            prim.encode_to_buffer(buffer)
-            + write_list(buffer, args)
-            + encode_annotation(buffer, annot)
-            + 1
-        }
-    }
+    let size =
+        match (&args[..], &annot[..]) {
+            ([], []) => {
+                buffer.push(3);
+                prim.encode_to_buffer(buffer) + 1
+            },
+            ([], _) => {
+                buffer.push(4);
+                prim.encode_to_buffer(buffer)
+                + encode_annotation(buffer, annot)
+                + 1
+            },
+            ([arg1], []) => {
+                buffer.push(5);
+                prim.encode_to_buffer(buffer)
+                + arg1.encode_to_buffer(buffer)
+                + 1
+            },
+            ([arg1], _) => {
+                buffer.push(6);
+                prim.encode_to_buffer(buffer)
+                + arg1.encode_to_buffer(buffer)
+                + encode_annotation(buffer, annot)
+                + 1
+            },
+            ([arg1, arg2], []) => {
+                buffer.push(7);
+                prim.encode_to_buffer(buffer)
+                + arg1.encode_to_buffer(buffer)
+                + arg2.encode_to_buffer(buffer)
+                + 1
+            },
+            ([arg1, arg2], _) => {
+                buffer.push(8);
+                prim.encode_to_buffer(buffer)
+                + arg1.encode_to_buffer(buffer)
+                + arg2.encode_to_buffer(buffer)
+                + encode_annotation(buffer, annot)
+                + 1
+            }
+            (_, _) => {
+                buffer.push(9);
+                prim.encode_to_buffer(buffer)
+                + write_list(buffer, args)
+                + encode_annotation(buffer, annot)
+                + 1
+            }
+        };
+    size
 }
 
 impl<P: Encodable + Debug> Node<P> {
@@ -224,15 +260,19 @@ impl<P: Encodable + Debug> Node<P> {
         buffer
     }
 
-    fn from_offset(buffer: &[u8], offset: usize) -> Result<(Node<P>, usize), &str> {
+    fn from_offset(buffer: &[u8], offset: usize) -> Result<(Node<P>, usize), Error> {
+        if offset >= buffer.len() {
+            return Err(Error::OutOfBounds)
+        }
+
         match buffer[offset] {
             0 => {
-                let (value, size) = read_zarith(&buffer[offset + 1..]);
+                let (value, size) = read_zarith(&buffer[offset + 1..])?;
                 Ok((Node::Int(value), size + 1))
             },
             1 => {
                 let (value, size) = read_vec(&buffer[offset + 1..])?;
-                let string = String::from_utf8(value).expect("Only UTF-8 allowed");
+                let string = String::from_utf8(value).map_err(|_| Error::InvalidString)?;
                 Ok((Node::String(string), size + 1))
             },
             2 => {
@@ -240,40 +280,40 @@ impl<P: Encodable + Debug> Node<P> {
                 Ok((Node::Seq(items), size + 1))
             },
             3 => {
-                let (prim, size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 Ok((Node::Prim(prim, vec![], vec![]), size + 1))
             },
             4 => {
-                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 let (annot, annot_size) = read_annotation(&buffer[offset + prim_size + 1..])?;
                 Ok((Node::Prim(prim, vec![], annot), prim_size + annot_size + 1))
             },
             5 => {
-                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 let (arg, arg_size) = Node::from_offset(buffer, offset + prim_size + 1)?;
                 Ok((Node::Prim(prim, vec![arg], vec![]), prim_size + arg_size + 1))
             },
             6 => {
-                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 let (arg, arg_size) = Node::from_offset(buffer, offset + prim_size + 1)?;
                 let (annot, annot_size) = read_annotation(&buffer[offset + prim_size + arg_size + 1..])?;
                 Ok((Node::Prim(prim, vec![arg], annot), prim_size + arg_size + annot_size + 1))
             },
             7 => {
-                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 let (arg1, arg1_size) = Node::from_offset(buffer, offset + prim_size + 1)?;
                 let (arg2, arg2_size) = Node::from_offset(buffer, offset + prim_size + arg1_size + 1)?;
                 Ok((Node::Prim(prim, vec![arg1, arg2], vec![]), prim_size + arg1_size + arg2_size + 1))
             },
             8 => {
-                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 let (arg1, arg1_size) = Node::from_offset(buffer, offset + prim_size + 1)?;
                 let (arg2, arg2_size) = Node::from_offset(buffer, offset + prim_size + arg1_size + 1)?;
                 let (annot, annot_size) = read_annotation(&buffer[offset + prim_size + arg1_size + arg2_size + 1..])?;
                 Ok((Node::Prim(prim, vec![arg1, arg2], annot), prim_size + arg1_size + arg2_size + annot_size + 1))
             },
             9 => {
-                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..])?;
+                let (prim, prim_size) = P::decode_from_buffer(&buffer[offset + 1..]).ok_or(Error::InvalidPrimitive)?;
                 let (args, args_size) = read_list(&buffer[offset + prim_size + 1..])?;
                 let (annot, annot_size) = read_annotation(&buffer[offset + prim_size + args_size + 1..])?;
                 Ok((Node::Prim(prim, args, annot), prim_size + args_size + annot_size))
@@ -282,11 +322,11 @@ impl<P: Encodable + Debug> Node<P> {
                 let (value, size) = read_vec(&buffer[offset + 1..])?;
                 Ok((Node::Bytes(value), size + 1))
             }
-            _ => Err("Invalid value")
+            _ => Err(Error::InvalidPrimitive)
         }
     }
 
-    pub fn from(buffer: &[u8]) -> Result<Node<P>, &str> {
+    pub fn from(buffer: &[u8]) -> Result<Node<P>, Error> {
         let (value, _) = Node::from_offset(buffer, 0)?;
         Ok(value)
     }
@@ -302,10 +342,9 @@ impl Encodable for Primitive {
         1
     }
 
-    fn decode_from_buffer(buffer: &[u8]) -> Result<(Self, usize), &str> where Self: Sized {
+    fn decode_from_buffer(buffer: &[u8]) -> Option<(Self, usize)> where Self: Sized {
         Primitive::from_int_enum(buffer[0])
             .map(|value| (value, 1))
-            .ok_or("Invalid primitive value")
     }
 }
 
@@ -321,12 +360,12 @@ mod tests {
             1
         }
 
-        fn decode_from_buffer(buffer: &[u8]) -> Result<(Self, usize), &str> where Self: Sized {
+        fn decode_from_buffer(buffer: &[u8]) -> Option<(Self, usize)> where Self: Sized {
             if buffer[0] != 0 {
-                return Err("Invalid DummyPrimitive");
+                return None;
             }
 
-            Ok((DummyPrimitive, 1))
+            Some((DummyPrimitive, 1))
         }
     }
 
@@ -347,6 +386,8 @@ mod tests {
         assert_eq!(Node::<DummyPrimitive>::from(b"\x00\xcc\x1f").unwrap(), Node::Int(-1996));
         assert_eq!(Node::<DummyPrimitive>::from(b"\x00\xa3\x89\x8b\x06").unwrap(), Node::Int(0x616263));
         assert_eq!(Node::<DummyPrimitive>::from(b"\x00\xe3\x89\x8b\x06").unwrap(), Node::Int(-0x616263));
+
+        assert_eq!(Node::<DummyPrimitive>::from(b"\x00\xe3\x89\x8b\x86"), Err(Error::InvalidInteger));
     }
 
     #[test]
@@ -367,6 +408,15 @@ mod tests {
         assert_eq!(
             Node::<DummyPrimitive>::from(b"\x01\x00\x00\x00\x00").unwrap(),
             Node::String::<DummyPrimitive>(String::from(""))
+        );
+
+        assert_eq!(
+            Node::<DummyPrimitive>::from(b"\x01\x00\x00\x00\x0aasdfegegg"),
+            Err(Error::InvalidString)
+        );
+        assert_eq!(
+            Node::<DummyPrimitive>::from(b"\x01\x00\x00\x00\x0aasdfegegg\xff"),
+            Err(Error::InvalidString)
         );
     }
 
@@ -398,6 +448,11 @@ mod tests {
                 vec![Node::Int(1), Node::Int(2)]
             )
         );
+
+        assert_eq!(
+            Node::<DummyPrimitive>::from(b"\x02\x00\x00\x00\x03\x00\x01\x00\x02"),
+            Err(Error::InvalidList)
+        );
     }
 
     #[test]
@@ -418,6 +473,11 @@ mod tests {
                 vec![],
                 vec![]
             )
+        );
+
+        assert_eq!(
+            Node::<DummyPrimitive>::from(b"\x03\x01"),
+            Err(Error::InvalidPrimitive)
         );
     }
 
@@ -625,6 +685,11 @@ mod tests {
                 vec![String::from("%annot1"), String::from("%annot2")]
             )
         );
+
+        assert_eq!(
+            Node::<DummyPrimitive>::from(b""),
+            Err(Error::OutOfBounds)
+        )
     }
 
     #[test]
